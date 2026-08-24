@@ -54,6 +54,7 @@ import type {
   ImageAttachResponse,
   SessionRedirectResponse
 } from '../../../types'
+import { sessionContextDrift } from '../session-context-drift'
 
 import {
   appendMidTurnUserMessage,
@@ -907,6 +908,8 @@ export function usePromptActions({
         storedSessionIdOverride === undefined ? selectedStoredSessionIdRef.current : storedSessionIdOverride
 
       const requestForOwner = requestForOwnerOverride ?? requestForStoredPromptSession(storedSessionId)
+      const startingRouteToken = getRouteToken()
+      const startingSelectedStoredSessionId = storedSessionId
 
       return runRewindSubmit(
         requestForOwner,
@@ -917,6 +920,14 @@ export function usePromptActions({
         interruptFirst,
         {
           storedSessionId,
+          driftReason: () =>
+            sessionContextDrift({
+              startRouteToken: startingRouteToken,
+              nowRouteToken: getRouteToken(),
+              startSelectedStoredId: startingSelectedStoredSessionId,
+              nowSelectedStoredId: selectedStoredSessionIdRef.current,
+              submitTargetStoredId: storedSessionId
+            }),
           onSessionRecovered: recoveredId => {
             activeSessionIdRef.current = recoveredId
             setActiveSessionId(recoveredId)
@@ -926,7 +937,7 @@ export function usePromptActions({
         sourceText
       )
     },
-    [activeSessionIdRef, requestForStoredPromptSession, selectedStoredSessionIdRef]
+    [activeSessionIdRef, getRouteToken, requestForStoredPromptSession, selectedStoredSessionIdRef]
   )
 
   const reloadFromMessage = useCallback(
@@ -1032,10 +1043,14 @@ export function usePromptActions({
         // The rewind never landed (e.g. the gateway stayed busy past the retry
         // deadline). Roll the optimistic truncation back to the full original
         // history so the UI doesn't desync from what's persisted — leaving it
-        // truncated is what made subsequent sends look duplicative.
-        setMutableRef(busyRef, false)
-        setBusy(false)
-        setAwaitingResponse(false)
+        // truncated is what made subsequent sends look duplicative. Foreground
+        // atoms may already belong to a newly selected session.
+        if (activeSessionIdRef.current === sessionId) {
+          setMutableRef(busyRef, false)
+          setBusy(false)
+          setAwaitingResponse(false)
+        }
+
         updateSessionState(sessionId, state => ({
           ...state,
           busy: false,

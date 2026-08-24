@@ -2785,6 +2785,36 @@ describe('usePromptActions restoreToMessage', () => {
     expect(lastState.busy).toBe(false)
   })
 
+  it('preserves a newly selected session foreground state when restore rollback runs', async () => {
+    const activeSessionIdRef = { current: RUNTIME_SESSION_ID as null | string }
+    const foregroundBusyRef = { current: false }
+
+    const requestGateway = vi.fn(async () => {
+      activeSessionIdRef.current = 'runtime-b'
+      foregroundBusyRef.current = true
+      $busy.set(true)
+      $awaitingResponse.set(true)
+      throw new Error('gateway exploded')
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionIdRef={activeSessionIdRef}
+        busyRef={foregroundBusyRef}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await expect(handle!.restoreToMessage('u2')).rejects.toThrow('gateway exploded')
+    expect(activeSessionIdRef.current).toBe('runtime-b')
+    expect(foregroundBusyRef.current).toBe(true)
+    expect($busy.get()).toBe(true)
+    expect($awaitingResponse.get()).toBe(true)
+  })
+
   it('interrupts the live turn and retries past "session busy" when reverting mid-stream', async () => {
     $busy.set(true)
 
@@ -3558,6 +3588,53 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[2]?.params).toEqual(
       expect.objectContaining({ session_id: RECOVERED_SESSION_ID, text: 'original prompt' })
     )
+  })
+
+  it('aborts regenerate recovery when selection changes during session.resume', async () => {
+    $busy.set(false)
+    setMessages([
+      { id: 'u1', parts: [textPart('original prompt')], role: 'user', timestamp: 0 },
+      { id: 'a1', parts: [textPart('reply')], role: 'assistant', timestamp: 1 }
+    ] as never)
+
+    const activeSessionIdRef = { current: RUNTIME_SESSION_ID as null | string }
+    const selectedStoredSessionIdRef = { current: STORED_SESSION_ID as null | string }
+    const calls: string[] = []
+    let submitAttempts = 0
+
+    const requestGateway = vi.fn(async (method: string) => {
+      calls.push(method)
+
+      if (method === 'prompt.submit' && submitAttempts++ === 0) {
+        throw new Error('session not found')
+      }
+
+      if (method === 'session.resume') {
+        activeSessionIdRef.current = 'runtime-b'
+        selectedStoredSessionIdRef.current = 'stored-b'
+
+        return { session_id: RECOVERED_SESSION_ID } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionIdRef={activeSessionIdRef}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={STORED_SESSION_ID}
+      />
+    )
+
+    await handle!.reloadFromMessage('u1')
+
+    expect(calls).toEqual(['prompt.submit', 'session.resume'])
+    expect(activeSessionIdRef.current).toBe('runtime-b')
   })
 
   // #67603 (second symptom): a recovery resume must re-register on the session's

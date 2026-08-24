@@ -221,7 +221,11 @@ export async function runRewindSubmit(
   truncateOrdinal: number | undefined,
   truncateMessageId: string | undefined,
   interruptFirst: boolean,
-  recovery?: { storedSessionId?: null | string; onSessionRecovered?: (sessionId: string) => void },
+  recovery?: {
+    driftReason?: () => null | string
+    storedSessionId?: null | string
+    onSessionRecovered?: (sessionId: string) => void
+  },
   truncateRowId?: number,
   sourceText?: string
 ): Promise<SurvivorUserRowIds | undefined> {
@@ -306,6 +310,7 @@ export async function runRewindSubmit(
       submitFor,
       {
         requestGateway,
+        driftReason: recovery?.driftReason,
         onRecovered: recoveredId => {
           liveSessionId = recoveredId
           recovery?.onSessionRecovered?.(recoveredId)
