@@ -39,6 +39,7 @@ import {
   setMessages,
   setTurnStartedAt
 } from '@/store/session'
+import type { SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionStates } from '@/store/session-states'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
@@ -53,6 +54,7 @@ import type {
   ImageAttachResponse,
   SessionRedirectResponse
 } from '../../../types'
+import { sessionContextDrift } from '../session-context-drift'
 
 import {
   appendMidTurnUserMessage,
@@ -78,6 +80,7 @@ import {
   markSessionRecentlyInterrupted,
   readFileDataUrlForAttach,
   readImageForRemoteAttach,
+  SessionRecoveryAborted,
   shouldInterruptBeforeRewind,
   type SubmitTextOptions,
   withSessionNotFoundResume
@@ -239,7 +242,11 @@ interface PromptActionsOptions {
   openMemoryGraph: () => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
-  resumeStoredSession: (storedSessionId: string) => Promise<void> | void
+  resumeStoredSession: (
+    storedSessionId: string,
+    replaceRoute?: boolean,
+    capturedOwner?: SessionProfileRoute
+  ) => Promise<void> | void
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
@@ -490,9 +497,8 @@ export function usePromptActions({
   // every follow-up session RPC on the same composite owner; otherwise resume
   // succeeds on HERMES01 and prompt.submit immediately fails locally with
   // "session not found".
-  const requestForPromptSession = useCallback<GatewayRequest>(
-    (method, params = {}, timeoutMs) => {
-      const storedSessionId = selectedStoredSessionIdRef.current
+  const captureStoredPromptSessionOwner = useCallback(
+    (storedSessionId: null | string): { request: GatewayRequest; route?: SessionProfileRoute } => {
       const owner = storedSessionId ? getSessionOwnerHint(storedSessionId) : undefined
       const ambientConnection = $connection.get()
 
@@ -501,12 +507,33 @@ export function usePromptActions({
         (ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || '' : '')
 
       if (connectionId) {
-        return requestGatewayForAgent(connectionId, owner?.profile || 'default', method, params, timeoutMs)
+        const profile = owner?.profile || 'default'
+        const route = owner || { connectionId, profile }
+
+        return {
+          request: (method, params = {}, timeoutMs) =>
+            requestGatewayForAgent(connectionId, profile, method, params, timeoutMs),
+          route
+        }
       }
 
-      return timeoutMs === undefined ? requestGateway(method, params) : requestGateway(method, params, timeoutMs)
+      return {
+        request: (method, params = {}, timeoutMs) =>
+          timeoutMs === undefined ? requestGateway(method, params) : requestGateway(method, params, timeoutMs)
+      }
     },
-    [requestGateway, selectedStoredSessionIdRef]
+    [requestGateway]
+  )
+
+  const requestForStoredPromptSession = useCallback(
+    (storedSessionId: null | string): GatewayRequest => captureStoredPromptSessionOwner(storedSessionId).request,
+    [captureStoredPromptSessionOwner]
+  )
+
+  const requestForPromptSession = useCallback<GatewayRequest>(
+    (method, params = {}, timeoutMs) =>
+      requestForStoredPromptSession(selectedStoredSessionIdRef.current)(method, params, timeoutMs),
+    [requestForStoredPromptSession, selectedStoredSessionIdRef]
   )
 
   const submitPromptText = useSubmitPrompt({
@@ -873,17 +900,34 @@ export function usePromptActions({
       truncateMessageId: string | undefined,
       interruptFirst: boolean,
       truncateRowId?: number,
-      sourceText?: string
-    ) =>
-      runRewindSubmit(
-        requestGateway,
+      sourceText?: string,
+      storedSessionIdOverride?: null | string,
+      requestForOwnerOverride?: GatewayRequest
+    ) => {
+      const storedSessionId =
+        storedSessionIdOverride === undefined ? selectedStoredSessionIdRef.current : storedSessionIdOverride
+
+      const requestForOwner = requestForOwnerOverride ?? requestForStoredPromptSession(storedSessionId)
+      const startingRouteToken = getRouteToken()
+      const startingSelectedStoredSessionId = storedSessionId
+
+      return runRewindSubmit(
+        requestForOwner,
         sessionId,
         text,
         truncateOrdinal,
         truncateMessageId,
         interruptFirst,
         {
-          storedSessionId: selectedStoredSessionIdRef.current,
+          storedSessionId,
+          driftReason: () =>
+            sessionContextDrift({
+              startRouteToken: startingRouteToken,
+              nowRouteToken: getRouteToken(),
+              startSelectedStoredId: startingSelectedStoredSessionId,
+              nowSelectedStoredId: selectedStoredSessionIdRef.current,
+              submitTargetStoredId: storedSessionId
+            }),
           onSessionRecovered: recoveredId => {
             activeSessionIdRef.current = recoveredId
             setActiveSessionId(recoveredId)
@@ -891,8 +935,9 @@ export function usePromptActions({
         },
         truncateRowId,
         sourceText
-      ),
-    [activeSessionIdRef, requestGateway, selectedStoredSessionIdRef]
+      )
+    },
+    [activeSessionIdRef, getRouteToken, requestForStoredPromptSession, selectedStoredSessionIdRef]
   )
 
   const reloadFromMessage = useCallback(
@@ -998,10 +1043,14 @@ export function usePromptActions({
         // The rewind never landed (e.g. the gateway stayed busy past the retry
         // deadline). Roll the optimistic truncation back to the full original
         // history so the UI doesn't desync from what's persisted — leaving it
-        // truncated is what made subsequent sends look duplicative.
-        setMutableRef(busyRef, false)
-        setBusy(false)
-        setAwaitingResponse(false)
+        // truncated is what made subsequent sends look duplicative. Foreground
+        // atoms may already belong to a newly selected session.
+        if (activeSessionIdRef.current === sessionId) {
+          setMutableRef(busyRef, false)
+          setBusy(false)
+          setAwaitingResponse(false)
+        }
+
         updateSessionState(sessionId, state => ({
           ...state,
           busy: false,
@@ -1021,6 +1070,9 @@ export function usePromptActions({
       // Ref, not the closure-captured prop — an edit rewinds and resubmits, so
       // a stale target rewrites the wrong session's history.
       const sessionId = activeSessionIdRef.current
+      const storedSessionId = selectedStoredSessionIdRef.current
+      const capturedOwner = captureStoredPromptSessionOwner(storedSessionId)
+      const requestForOwner = capturedOwner.request
       const messages = $messages.get()
       const plan = sessionId ? planEdit(messages, edited) : null
 
@@ -1075,7 +1127,9 @@ export function usePromptActions({
           plan.truncateMessageId,
           interruptFirst,
           plan.truncateRowId,
-          plan.sourceText
+          plan.sourceText,
+          storedSessionId,
+          requestForOwner
         )
 
         applySurvivorRowIds(sessionId, survivorRowIds)
@@ -1091,10 +1145,12 @@ export function usePromptActions({
         // as a new turn (#82462).
         if (!plan.isFailedTurn && !unavailable && isStaleTargetError(err)) {
           try {
-            const storedId = selectedStoredSessionIdRef.current
+            if (storedSessionId) {
+              await resumeStoredSession(storedSessionId, false, capturedOwner.route)
 
-            if (storedId) {
-              await resumeStoredSession(storedId)
+              if (selectedStoredSessionIdRef.current !== storedSessionId) {
+                throw new SessionRecoveryAborted('selection changed during edit recovery', sessionId)
+              }
             }
 
             const refreshed = $messages.get()
@@ -1108,7 +1164,9 @@ export function usePromptActions({
                 retryPlan.truncateMessageId,
                 false,
                 retryPlan.truncateRowId,
-                retryPlan.sourceText
+                retryPlan.sourceText,
+                storedSessionId,
+                requestForOwner
               )
 
               applySurvivorRowIds(sessionId, survivorRowIds)
@@ -1125,10 +1183,14 @@ export function usePromptActions({
 
         // Roll the optimistic edit/truncation back to the original history so the
         // UI stays in sync with what's persisted instead of stranding a partial
-        // timeline.
-        setMutableRef(busyRef, false)
-        setBusy(false)
-        setAwaitingResponse(false)
+        // timeline. Foreground atoms may already belong to a newly selected
+        // session, so only its owner may clear them.
+        if (activeSessionIdRef.current === sessionId) {
+          setMutableRef(busyRef, false)
+          setBusy(false)
+          setAwaitingResponse(false)
+        }
+
         updateSessionState(sessionId, state => ({
           ...state,
           busy: false,
@@ -1137,13 +1199,17 @@ export function usePromptActions({
           turnStartedAt: null,
           messages
         }))
-        notifyError(surfaced, unavailable ? copy.editTurnUnavailable : copy.editFailed)
+
+        if (!(surfaced instanceof SessionRecoveryAborted)) {
+          notifyError(surfaced, unavailable ? copy.editTurnUnavailable : copy.editFailed)
+        }
       }
     },
     [
       activeSessionIdRef,
       applySurvivorRowIds,
       busyRef,
+      captureStoredPromptSessionOwner,
       copy.editFailed,
       copy.editTurnUnavailable,
       resumeStoredSession,

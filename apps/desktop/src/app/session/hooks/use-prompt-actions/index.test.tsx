@@ -14,6 +14,7 @@ import { $goalsBySession, setSessionGoal } from '@/store/goals'
 import { $hudMode } from '@/store/hud'
 import { $notifications, clearNotifications } from '@/store/notifications'
 import {
+  $awaitingResponse,
   $busy,
   $connection,
   $currentCwd,
@@ -26,6 +27,7 @@ import {
   setMessages,
   setSessions
 } from '@/store/session'
+import type { SessionProfileRoute } from '@/store/session-request-router'
 import { dropSessionState, publishSessionState } from '@/store/session-states'
 import { $wakeWord, resetWakeWordState } from '@/store/wake-word'
 import type { SessionInfo } from '@/types/hermes'
@@ -143,7 +145,11 @@ function Harness({
   openMemoryGraph?: () => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
-  resumeStoredSession?: (storedSessionId: string) => Promise<void> | void
+  resumeStoredSession?: (
+    storedSessionId: string,
+    replaceRoute?: boolean,
+    capturedOwner?: SessionProfileRoute
+  ) => Promise<void> | void
   runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
   seedMessages?: unknown[]
   seedStreamId?: null | string
@@ -1808,6 +1814,192 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(ambientRequest).not.toHaveBeenCalled()
   })
 
+  it('pins regenerate to the active registry connection when the remote session row is untagged', async () => {
+    $busy.set(false)
+    $connection.set({ connectionId: 'hermes01', mode: 'remote' } as never)
+    setSessions([sessionInfo({ id: 'stored-remote', profile: 'default' })])
+    setMessages([
+      { id: 'u1', parts: [textPart('original prompt')], role: 'user', timestamp: 0 },
+      { id: 'a1', parts: [textPart('remote reply')], role: 'assistant', timestamp: 1 }
+    ] as never)
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({} as never)
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId="runtime-remote"
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={ambientRequest}
+        runtimeIdByStoredSessionIdRef={{ current: new Map([['stored-remote', 'runtime-remote']]) }}
+        storedSessionId="stored-remote"
+      />
+    )
+
+    await handle!.reloadFromMessage('u1')
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'hermes01',
+      'default',
+      'prompt.submit',
+      expect.objectContaining({ session_id: 'runtime-remote', text: 'original prompt' }),
+      1_800_000
+    )
+    expect(ambientRequest).not.toHaveBeenCalled()
+  })
+
+  it('keeps regenerate on its captured owner when selection changes during history lookup', async () => {
+    $busy.set(false)
+    $connection.set({ connectionId: 'source-a', mode: 'remote' } as never)
+    setSessions([sessionInfo({ id: 'stored-a', profile: 'default' })])
+    setMessages([
+      { id: 'user-synthetic-1', parts: [textPart('original prompt')], role: 'user', timestamp: 0 },
+      { id: 'assistant-synthetic-1', parts: [textPart('remote reply')], role: 'assistant', timestamp: 1 }
+    ] as never)
+
+    const selectedStoredSessionIdRef = { current: 'stored-a' }
+    let releaseHistory!: (value: unknown) => void
+
+    const history = new Promise(resolve => {
+      releaseHistory = resolve
+    })
+
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method) => {
+      if (method === 'session.history') {
+        return await history as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId="runtime-a"
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        runtimeIdByStoredSessionIdRef={{ current: new Map([['stored-a', 'runtime-a']]) }}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+      />
+    )
+
+    const regenerate = handle!.reloadFromMessage('user-synthetic-1')
+    await waitFor(() =>
+      expect(requestGatewayForAgent).toHaveBeenCalledWith(
+        'source-a',
+        'default',
+        'session.history',
+        { session_id: 'runtime-a' },
+        undefined
+      )
+    )
+
+    selectedStoredSessionIdRef.current = 'stored-b'
+    $connection.set({ connectionId: 'source-b', mode: 'remote' } as never)
+    releaseHistory({ messages: [{ role: 'user', row_id: 17, text: 'original prompt' }] })
+    await regenerate
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-a',
+      'default',
+      'prompt.submit',
+      expect.objectContaining({ session_id: 'runtime-a', text: 'original prompt', truncate_before_row_id: 17 }),
+      1_800_000
+    )
+    expect(requestGatewayForAgent).not.toHaveBeenCalledWith(
+      'source-b',
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything()
+    )
+  })
+
+  it('aborts a stale-target edit retry when selection changes during captured-owner resume', async () => {
+    $busy.set(false)
+    $connection.set({ connectionId: 'source-a', mode: 'remote' } as never)
+    setSessions([sessionInfo({ id: 'stored-a', profile: 'default' })])
+
+    const seed = [
+      { id: 'u1', parts: [textPart('original prompt')], role: 'user' as const, timestamp: 0 },
+      { id: 'a1', parts: [textPart('remote reply')], role: 'assistant' as const, timestamp: 1 }
+    ]
+
+    const refreshed = [
+      { id: 'u1', parts: [textPart('original prompt')], role: 'user' as const, rowId: 17, timestamp: 0 },
+      { id: 'a1', parts: [textPart('remote reply')], role: 'assistant' as const, timestamp: 1 }
+    ]
+
+    const activeSessionIdRef = { current: 'runtime-a' as null | string }
+    const foregroundBusyRef = { current: false }
+    const selectedStoredSessionIdRef = { current: 'stored-a' }
+
+    const resumeStoredSession = vi.fn(async () => {
+      activeSessionIdRef.current = 'runtime-b'
+      foregroundBusyRef.current = true
+      selectedStoredSessionIdRef.current = 'stored-b'
+      $connection.set({ connectionId: 'source-b', mode: 'remote' } as never)
+      $busy.set(true)
+      $awaitingResponse.set(true)
+      setMessages(refreshed)
+    })
+
+    let submitCount = 0
+
+    setMessages(seed)
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method) => {
+      if (method === 'prompt.submit' && submitCount++ === 0) {
+        throw new Error('target user message is no longer in session history')
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionIdRef={activeSessionIdRef}
+        busyRef={foregroundBusyRef}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={vi.fn(async () => ({}) as never)}
+        resumeStoredSession={resumeStoredSession}
+        runtimeIdByStoredSessionIdRef={{ current: new Map([['stored-a', 'runtime-a']]) }}
+        seedMessages={seed}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+      />
+    )
+
+    await handle!.editMessage({
+      content: [{ text: 'edited prompt', type: 'text' }],
+      parentId: null,
+      role: 'user',
+      sourceId: 'u1'
+    } as never)
+
+    expect(resumeStoredSession).toHaveBeenCalledWith('stored-a', false, {
+      connectionId: 'source-a',
+      profile: 'default'
+    })
+    const submitCalls = vi.mocked(requestGatewayForAgent).mock.calls.filter(([, , method]) => method === 'prompt.submit')
+
+    expect(submitCalls).toHaveLength(1)
+    expect(submitCalls[0]).toEqual([
+      'source-a',
+      'default',
+      'prompt.submit',
+      expect.objectContaining({ session_id: 'runtime-a', text: 'edited prompt' }),
+      1_800_000
+    ])
+    expect(activeSessionIdRef.current).toBe('runtime-b')
+    expect(foregroundBusyRef.current).toBe(true)
+    expect($busy.get()).toBe(true)
+    expect($awaitingResponse.get()).toBe(true)
+  })
+
   it('clears a leftover interrupted flag on a fresh submit (so the new turn streams)', async () => {
     const seeds: Record<string, unknown>[] = []
     const requestGateway = vi.fn(async () => ({}) as never)
@@ -2593,6 +2785,36 @@ describe('usePromptActions restoreToMessage', () => {
     expect(lastState.busy).toBe(false)
   })
 
+  it('preserves a newly selected session foreground state when restore rollback runs', async () => {
+    const activeSessionIdRef = { current: RUNTIME_SESSION_ID as null | string }
+    const foregroundBusyRef = { current: false }
+
+    const requestGateway = vi.fn(async () => {
+      activeSessionIdRef.current = 'runtime-b'
+      foregroundBusyRef.current = true
+      $busy.set(true)
+      $awaitingResponse.set(true)
+      throw new Error('gateway exploded')
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionIdRef={activeSessionIdRef}
+        busyRef={foregroundBusyRef}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await expect(handle!.restoreToMessage('u2')).rejects.toThrow('gateway exploded')
+    expect(activeSessionIdRef.current).toBe('runtime-b')
+    expect(foregroundBusyRef.current).toBe(true)
+    expect($busy.get()).toBe(true)
+    expect($awaitingResponse.get()).toBe(true)
+  })
+
   it('interrupts the live turn and retries past "session busy" when reverting mid-stream', async () => {
     $busy.set(true)
 
@@ -3366,6 +3588,53 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[2]?.params).toEqual(
       expect.objectContaining({ session_id: RECOVERED_SESSION_ID, text: 'original prompt' })
     )
+  })
+
+  it('aborts regenerate recovery when selection changes during session.resume', async () => {
+    $busy.set(false)
+    setMessages([
+      { id: 'u1', parts: [textPart('original prompt')], role: 'user', timestamp: 0 },
+      { id: 'a1', parts: [textPart('reply')], role: 'assistant', timestamp: 1 }
+    ] as never)
+
+    const activeSessionIdRef = { current: RUNTIME_SESSION_ID as null | string }
+    const selectedStoredSessionIdRef = { current: STORED_SESSION_ID as null | string }
+    const calls: string[] = []
+    let submitAttempts = 0
+
+    const requestGateway = vi.fn(async (method: string) => {
+      calls.push(method)
+
+      if (method === 'prompt.submit' && submitAttempts++ === 0) {
+        throw new Error('session not found')
+      }
+
+      if (method === 'session.resume') {
+        activeSessionIdRef.current = 'runtime-b'
+        selectedStoredSessionIdRef.current = 'stored-b'
+
+        return { session_id: RECOVERED_SESSION_ID } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionIdRef={activeSessionIdRef}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={STORED_SESSION_ID}
+      />
+    )
+
+    await handle!.reloadFromMessage('u1')
+
+    expect(calls).toEqual(['prompt.submit', 'session.resume'])
+    expect(activeSessionIdRef.current).toBe('runtime-b')
   })
 
   // #67603 (second symptom): a recovery resume must re-register on the session's
