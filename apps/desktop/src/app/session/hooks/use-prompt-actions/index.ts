@@ -1168,10 +1168,14 @@ export function usePromptActions({
 
         // Roll the optimistic edit/truncation back to the original history so the
         // UI stays in sync with what's persisted instead of stranding a partial
-        // timeline.
-        setMutableRef(busyRef, false)
-        setBusy(false)
-        setAwaitingResponse(false)
+        // timeline. Foreground atoms may already belong to a newly selected
+        // session, so only its owner may clear them.
+        if (activeSessionIdRef.current === sessionId) {
+          setMutableRef(busyRef, false)
+          setBusy(false)
+          setAwaitingResponse(false)
+        }
+
         updateSessionState(sessionId, state => ({
           ...state,
           busy: false,

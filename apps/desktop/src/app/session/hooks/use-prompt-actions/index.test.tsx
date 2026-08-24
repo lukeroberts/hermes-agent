@@ -14,6 +14,7 @@ import { $goalsBySession, setSessionGoal } from '@/store/goals'
 import { $hudMode } from '@/store/hud'
 import { $notifications, clearNotifications } from '@/store/notifications'
 import {
+  $awaitingResponse,
   $busy,
   $connection,
   $currentCwd,
@@ -1932,11 +1933,17 @@ describe('usePromptActions submit / queue drain semantics', () => {
       { id: 'a1', parts: [textPart('remote reply')], role: 'assistant' as const, timestamp: 1 }
     ]
 
+    const activeSessionIdRef = { current: 'runtime-a' as null | string }
+    const foregroundBusyRef = { current: false }
     const selectedStoredSessionIdRef = { current: 'stored-a' }
 
     const resumeStoredSession = vi.fn(async () => {
+      activeSessionIdRef.current = 'runtime-b'
+      foregroundBusyRef.current = true
       selectedStoredSessionIdRef.current = 'stored-b'
       $connection.set({ connectionId: 'source-b', mode: 'remote' } as never)
+      $busy.set(true)
+      $awaitingResponse.set(true)
       setMessages(refreshed)
     })
 
@@ -1954,7 +1961,8 @@ describe('usePromptActions submit / queue drain semantics', () => {
     let handle: HarnessHandle | null = null
     await actRender(
       <Harness
-        activeSessionId="runtime-a"
+        activeSessionIdRef={activeSessionIdRef}
+        busyRef={foregroundBusyRef}
         onReady={h => (handle = h)}
         refreshSessions={async () => undefined}
         requestGateway={vi.fn(async () => ({}) as never)}
@@ -1986,6 +1994,10 @@ describe('usePromptActions submit / queue drain semantics', () => {
       expect.objectContaining({ session_id: 'runtime-a', text: 'edited prompt' }),
       1_800_000
     ])
+    expect(activeSessionIdRef.current).toBe('runtime-b')
+    expect(foregroundBusyRef.current).toBe(true)
+    expect($busy.get()).toBe(true)
+    expect($awaitingResponse.get()).toBe(true)
   })
 
   it('clears a leftover interrupted flag on a fresh submit (so the new turn streams)', async () => {
